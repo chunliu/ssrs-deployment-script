@@ -9,20 +9,20 @@
     The Uri of the report server portal.
 .PARAMETER excludedFolders
     The folders that need to be ignored.
-.NOTES
-    Author: Chun Liu
-    Version: 0.1
-.EXAMPLE
-    .\Install.ps1 -RSUri "http://localhost/reportserver/" -RPUri "http://localhost/reports/"
+.PARAMETER dataSources
+    The array of data sources.
 #>
 
 param(
-    [Parameter(Mandatory=$false)][String]$RSUri = "http://localhost/reportserver/",
-    [Parameter(Mandatory=$false)][String]$RPUri = "http://localhost/reports/",
-    [Parameter(Mandatory=$false)][String[]]$excludedFolders = @()
+    [String]$RSUri = "http://localhost/reportserver/",
+    [String]$RPUri = "http://localhost/reports/",
+    [String[]]$excludedFolders = @("CDR-Reports-Cube"),
+    [hashtable[]]$dataSources = @(<#@{DsName="Galactic";ConnString="Data Source=10.0.0.5;Initial Catalog=Galactic";userName="username";password="password"}#>)
 )
 
 $dsFolderName = "DataSources"
+$rtFolderName = "Reports"
+$rtFolderPath = "/Reports"
 
 if(-not (Get-Module -Name "ReportingServicesTools" -ListAvailable)) {
     Invoke-Expression (Invoke-WebRequest https://raw.githubusercontent.com/Microsoft/ReportingServicesTools/master/Install.ps1)
@@ -39,11 +39,11 @@ Function UpdateSharedDS {
     $dsrefs = Get-RsItemDataSource -RsItem $rsItem
     foreach($dsref in $dsrefs) {
         if($dsName) {
-            $dsPath = "/$($dsFolderName)/$($dsName)"
+            $dsPath = "$($rtFolderPath)/$($dsFolderName)/$($dsName)"
         } else {
-            $dsPath = "/$($dsFolderName)/$($dsref.Name)"
+            $dsPath = "$($rtFolderPath)/$($dsFolderName)/$($dsref.Name)"
         }
-        $ds = Get-RsDataSource -Path $dsPath -ErrorAction SilentlyContinue
+        $ds = Get-RsDataSource -Path $dsPath
         if($ds) {
             Write-Host "Update the data source reference for $($rsItem) to $($dsPath)"
             Set-RsDataSourceReference -Path $rsItem -DataSourceName $dsref.Name -DataSourcePath $dsPath
@@ -53,16 +53,46 @@ Function UpdateSharedDS {
     }
 }
 
+Function UpdateDSConnString {
+    param(
+        [string]$dsName
+    )
+
+    # Update connection string of the data sources
+    foreach($dataSource in $dataSources) {
+        if($dataSource.DsName -ne $dsName) {
+            continue
+        }
+
+        $dsPath = "$($rtFolderPath)/$($dsFolderName)/$($dataSource.DsName)"
+        Write-Host "Update the connection string of $($dataSource.DsName)"
+        $ds = Get-RsDataSource -Path "$($rtFolderPath)/$($dsFolderName)/$($dataSource.DsName)"
+        $ds.ConnectString = $dataSource.ConnString
+        if($dataSource.userName) {
+            $ds.CredentialRetrieval = "Store"
+            $ds.UserName = $dataSource.userName
+            $ds.Password = $dataSource.password
+        }
+
+        Set-RsDataSource -RsItem "$($rtFolderPath)/$($dsFolderName)/$($dataSource.DsName)" -DataSourceDefinition $ds
+    }
+}
+
 # Initialize the connection
 Connect-RsReportServer -ReportServerUri $RSUri -ReportPortalUri $RPUri
 
-$serverReportFolders = Get-RsFolderContent -RsFolder "/" | Select -ExpandProperty Name
+$rootFolder = Get-RsFolderContent -RsFolder "/" | Where {$_.Name -EQ $rtFolderName}
+if(!$rootFolder) {
+    New-RsFolder -RsFolder "/" -FolderName $rtFolderName
+}
+
+$serverReportFolders = Get-RsFolderContent -RsFolder $rtFolderPath | Select -ExpandProperty Name
 $localReportFolders = Get-ChildItem -Path $PSScriptRoot -Directory | Select -ExpandProperty PSChildName
 
 # Create data source folder
 if($serverReportFolders -notcontains $dsFolderName) {
     Write-Host "Create data source folder"
-    New-RsFolder -RsFolder "/" -FolderName $dsFolderName -Hidden
+    New-RsFolder -RsFolder $rtFolderPath -FolderName $dsFolderName -Hidden
 }
 
 foreach($rfName in $localReportFolders) {
@@ -72,16 +102,17 @@ foreach($rfName in $localReportFolders) {
     # Create report folder if it doesn't exist.
     if($serverReportFolders -notcontains $rfName) {
         Write-Host "Create folder $($rfName)"
-        New-RsFolder -RsFolder "/" -FolderName $rfName
+        New-RsFolder -RsFolder $rtFolderPath -FolderName $rfName
     }
 
     # Upload the data source if it doesn't exist.
     $dss = Get-ChildItem -Path "$($PSScriptRoot)\$($rfName)" -File -Filter "*.rds"
     foreach($ds in $dss) {
-        $ret = Get-RsFolderContent -RsFolder "/$($dsFolderName)" | Where Name -EQ $ds.BaseName
+        $ret = Get-RsFolderContent -RsFolder "$($rtFolderPath)/$($dsFolderName)" | Where Name -EQ $ds.BaseName
         if($ret.Count -eq 0) {
             Write-Host "Upload data source $($ds.Name)"
-            Write-RsCatalogItem -Path $ds.FullName -RsFolder "/$($dsFolderName)"
+            Write-RsCatalogItem -Path $ds.FullName -RsFolder "$($rtFolderPath)/$($dsFolderName)"
+            UpdateDSConnString $ds.BaseName
         }
     }
 
@@ -89,12 +120,12 @@ foreach($rfName in $localReportFolders) {
     $rsds = Get-ChildItem -Path "$($PSScriptRoot)\$($rfName)" -File -Filter "*.rsd"
     foreach($rds in $rsds) {
         Write-Host "Upload shared datasets..."
-        Write-RsCatalogItem -Path $rds.FullName -RsFolder "/$($rfName)" -Overwrite -Hidden
+        Write-RsCatalogItem -Path $rds.FullName -RsFolder "$($rtFolderPath)/$($rfName)" -Overwrite -Hidden
 
         [xml]$rdsxml = Get-Content $rds.FullName
         $dsName = $rdsxml.SharedDataSet.DataSet.Query.DataSourceReference
         if($dsName) {
-            UpdateSharedDS "/$($rfName)/$($rds.BaseName)" $dsFolderName $dsName
+            UpdateSharedDS "$($rtFolderPath)/$($rfName)/$($rds.BaseName)" $dsFolderName $dsName
         }
     }
 
@@ -103,9 +134,9 @@ foreach($rfName in $localReportFolders) {
     foreach($report in $reports) {
         # Upload reports
         Write-Host "Upload report $($report.Name) to folder $($rfName)"
-        Write-RsCatalogItem -Path $report.FullName -RsFolder "/$($rfName)" -Overwrite
+        Write-RsCatalogItem -Path $report.FullName -RsFolder "$($rtFolderPath)/$($rfName)" -Overwrite
         # Update report's data source reference
-        UpdateSharedDS "/$($rfName)/$($report.BaseName)" $dsFolderName
+        UpdateSharedDS "$($rtFolderPath)/$($rfName)/$($report.BaseName)" $dsFolderName
     }
 
     Write-Host "Reports have been deployed successfully!"
